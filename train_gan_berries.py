@@ -26,6 +26,7 @@ G_TEST_MOVING_AVERAGE_BETA = 0.999
 
 LATENT_SIZES = [128, 128, 128,  128,  64,   32] #from smallest image to biggest
 IMAGE_CHANNELS = 3
+DO_RANDOM_FLIPS = True #flip images randomly up/down and left/right when training
 
 #loaded = np.load("wholedemo_smaller.npy")
 loaded = np.load("berries128.npy")
@@ -451,12 +452,12 @@ generator_test = None
 
 @tf.function
 def get_data():
-    #data_len = loaded.shape[0]
-    data_len = 1
+    data_len = loaded.shape[0]
     indices = tf.random.uniform([BSIZE],maxval=data_len,dtype=tf.int32)
     data = tf.cast(tf.gather(loaded,indices),tf.float32)/(255.0/2.0)-1.0
-    #data = tf.image.random_flip_left_right(data)
-    #data = tf.image.random_flip_up_down(data)
+    if DO_RANDOM_FLIPS:
+        data = tf.image.random_flip_left_right(data)
+        data = tf.image.random_flip_up_down(data)
     return data
 
 @tf.function
