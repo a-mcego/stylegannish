@@ -36,6 +36,13 @@ print("Loaded images:",loaded.shape)
 
 loaded = tf.convert_to_tensor(loaded)
 
+#batch size
+BSIZE = 16
+
+#make the output directory if it doesnt exist yet
+if not os.path.exists("gan"):
+    os.mkdir("gan")
+
 with tf.device('/CPU:0'):
     loaded2 = tf.image.rot90(loaded,k=1)
     loaded = tf.concat([loaded,loaded2], axis=0)
@@ -48,7 +55,6 @@ def to_float(data):
 def to_int(data):
     return tf.cast(tf.clip_by_value((data+1.0)*(255.0/2.0),0.0,255.0),tf.uint8)
 
-BSIZE = 16
 
 class Conv2D3x3(tf.keras.Model):
     def __init__(self, outsize, activation=None):
@@ -127,7 +133,7 @@ class ScaledConv2D3x3(tf.keras.Model):
             ret = self.activation(ret)
         return ret
 
-
+#a layer that blurs every input feature map separately with a 3x3 filter
 class Blur3x3(tf.keras.Model):
     def __init__(self):
         super(Blur3x3, self).__init__()
@@ -152,6 +158,80 @@ ConvLayer = ScaledConv2D3x3
 def get_grid(coords, sce):
     return tf.expand_dims(sce(tf.stack(tf.meshgrid(tf.linspace(0.0, 1.0, coords[1]),tf.linspace(0.0, 1.0, coords[0])),axis=-1)),axis=0)
 
+class StyleBlock(tf.keras.Model):
+    def __init__(self,latent_size_prev,latent_size):
+        super(StyleBlock, self).__init__()
+        self.lrelu = lambda x: tf.keras.activations.relu(x, alpha=0.2)
+        self.conv = ConvLayer(latent_size,use_bias=False)
+        self.std_dense = DenseLayer(latent_size_prev, bias_initializer=tf.ones_initializer())
+        self.mean_dense = DenseLayer(latent_size_prev)
+        self.latent_size = latent_size
+
+    def build(self, input_shape):
+        self.bias = self.add_weight('bias_1',shape=[1,input_shape[1],input_shape[2],self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
+        self.noise_coef = self.add_weight('noise_coef1',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
+
+    def adaIN_normalize(self, data):
+        std = tf.math.reduce_std(data,axis=[-1,-2],keepdims=True)+1e-5
+        mean = tf.math.reduce_mean(data,axis=[-1,-2],keepdims=True)
+        data = (data-mean)/std
+        return data
+
+    def adaIN_modulate(self, data, latent):
+        newstd = self.std_dense(latent)
+        newmean = self.mean_dense(latent)
+
+        newshape = [newstd.shape[0],1,1,newstd.shape[1]]
+        newstd = tf.reshape(newstd,newshape)
+        newmean = tf.reshape(newmean,newshape) #can do this because newstd and newmean have the same shape
+
+        #everything is in the right shape, just put it all together.
+        return data*newstd+newmean
+
+    def call(self, data, latent):
+        data = self.adaIN_modulate(data, latent)
+        data = self.conv(data) 
+        data = self.adaIN_normalize(data)
+        data += self.bias
+        data += tf.multiply(tf.random.normal(data.shape),self.noise_coef)
+        data = self.lrelu(data)
+        return data
+
+class StyleBlock2(tf.keras.Model):
+    def __init__(self,latent_size_prev,latent_size):
+        super(StyleBlock2, self).__init__()
+        self.lrelu = lambda x: tf.keras.activations.relu(x, alpha=0.2)
+        self.std_dense = DenseLayer(latent_size_prev, bias_initializer=tf.ones_initializer())
+        self.latent_size = latent_size
+        self.conv_outsize = latent_size
+
+    def build(self, input_shape):
+        self.bias = self.add_weight('styleblock_bias',shape=[1,input_shape[1],input_shape[2],self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
+        self.noise_coef = self.add_weight('noise_coef',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
+        self.conv_insize = input_shape[-1]
+        self.conv_weights = self.add_weight('conv_weights',shape=[3, 3, self.conv_insize, self.conv_outsize], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
+        self.conv_coef = tf.math.sqrt(2.0 / tf.cast(self.conv_insize * 3 * 3,tf.float32))
+
+    def call(self, data, latent):
+        latent_out = self.std_dense(latent) # [BI] Transform incoming W to style.
+
+        data = data*latent_out[:, tf.newaxis, tf.newaxis, :] # [BhwI] Not fused => scale input activations.
+        newweights = self.conv_weights * self.conv_coef
+        data = tf.nn.conv2d(data, newweights, data_format='NHWC', strides=[1,1,1,1], padding='SAME')
+
+        ww = newweights[tf.newaxis] # [BkkIO] Introduce minibatch dimension.
+        ww = ww*latent_out[:, tf.newaxis, tf.newaxis, :, tf.newaxis] # [BkkIO] Scale input feature maps.
+        d = tf.math.rsqrt(tf.reduce_sum(tf.square(ww), axis=[1,2,3]) + 1e-8) # [BO] Scaling factor.
+        #ww = ww*d[:, tf.newaxis, tf.newaxis, tf.newaxis, :] # [BkkIO] Scale output feature maps.
+
+        data = data*d[:, tf.newaxis, tf.newaxis, :] # [BhwO] Not fused => scale output activations.
+
+        data += self.bias
+        data += tf.multiply(tf.random.normal(data.shape),self.noise_coef)
+        data = self.lrelu(data)
+        return data
+
+
 class G_block(tf.keras.Model):
     #image_size is size after possible upsampling. make sure it matches!
     def __init__(self, latent_size_prev, latent_size, image_size, upsample, resize):
@@ -164,17 +244,11 @@ class G_block(tf.keras.Model):
 
         if upsample:
             self.upsample = tf.keras.layers.UpSampling2D(interpolation='bilinear')
-            self.conv1 = ConvLayer(latent_size,use_bias=False)
-            self.std_dense1 = DenseLayer(latent_size_prev, bias_initializer=tf.ones_initializer())
-            self.mean_dense1 = DenseLayer(latent_size_prev)
+            self.styleblock1 = StyleBlock2(latent_size_prev,latent_size)
         else:
             self.upsample = None
-            #hack: upsample being None means we're in the first layer and we shouldn't do conv1
-            #      so we dont even define it here
 
-        self.conv2 = ConvLayer(latent_size,use_bias=False)
-        self.std_dense2 = DenseLayer(latent_size, bias_initializer=tf.ones_initializer())
-        self.mean_dense2 = DenseLayer(latent_size)
+        self.styleblock2 = StyleBlock2(latent_size,latent_size)
         self.pic_out = DenseLayer(IMAGE_CHANNELS) #equivalent to 1x1 convolution
 
         if resize is not None:
@@ -182,62 +256,12 @@ class G_block(tf.keras.Model):
         else:
             self.resizer = None
 
-    def build(self, input_shape):
-        if self.upsample is not None:
-            self.bias1 = self.add_weight('bias_1',shape=[1,input_shape[1]*2,input_shape[2]*2,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
-            self.bias2 = self.add_weight('bias_2',shape=[1,input_shape[1]*2,input_shape[2]*2,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
-            self.noise_coef1 = self.add_weight('noise_coef1',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
-        else:
-            self.bias1 = None
-            self.bias2 = self.add_weight('bias_2',shape=[1,input_shape[1],input_shape[2],self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
-
-        self.noise_coef2 = self.add_weight('noise_coef2',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
-
-    def adaIN_normalize(self, data):
-        std = tf.math.reduce_std(data,axis=[-1,-2],keepdims=True)+1e-5
-        mean = tf.math.reduce_mean(data,axis=[-1,-2],keepdims=True)
-        data = (data-mean)/std
-        return data
-
-    def adaIN_modulate(self, data, latent, std_dense, mean_dense):
-        newstd = std_dense(latent)
-        newmean = mean_dense(latent)
-
-        newshape = [newstd.shape[0],1,1,newstd.shape[1]]
-        newstd = tf.reshape(newstd,newshape)
-        newmean = tf.reshape(newmean,newshape) #can do this because newstd and newmean have the same shape
-
-        #everything is in the right shape, just put it all together.
-        return data*newstd+newmean
-
-    def adaIN_normalize_std(self, data):
-        std = tf.math.reduce_std(data,axis=[-1,-2],keepdims=True)+1e-5
-        data = data/std
-        return data
-
-    def adaIN_modulate_std(self, data, latent, std_dense):
-        newstd = std_dense(latent)
-        newshape = [newstd.shape[0],1,1,newstd.shape[1]]
-        newstd = tf.reshape(newstd,newshape)
-        return data*newstd
-
     def call(self, data, latent):
-        if self.upsample is not None:#hack: upsample being None means we're in the first layer and we shouldn't do conv1
-            data = self.adaIN_modulate(data, latent, self.std_dense1, self.mean_dense1)
+        if self.upsample is not None:#hack: upsample being None means we're in the first layer and we shouldn't do styleblock1
             data = self.upsample(data)
-            data = self.conv1(data) 
-            data = self.adaIN_normalize(data)
-            data += self.bias1
-            data += tf.multiply(tf.random.normal(data.shape),self.noise_coef1)
-            data = self.lrelu(data)
+            data = self.styleblock1(data,latent)
 
-        data = self.adaIN_modulate(data, latent, self.std_dense2, self.mean_dense2)
-        data = self.conv2(data)
-        data = self.adaIN_normalize(data)
-
-        data += self.bias2
-        data += tf.multiply(tf.random.normal(data.shape),self.noise_coef2)
-        data = self.lrelu(data)
+        data = self.styleblock2(data,latent)
 
         pic = self.pic_out(data)
         if self.resizer is not None:
