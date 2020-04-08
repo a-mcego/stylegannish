@@ -8,3 +8,7 @@ GAN implementation for TensorFlow 2 based on StyleGAN2 (https://arxiv.org/pdf/19
 * (As such, lazy regularisation as well)
 * Precision / recall statistics
 * Statistics for the contribution of each resolution to the output image (Figure 8 in the paper)
+* Truncation trick (psi)
+
+# Other TODO things
+* Save states
