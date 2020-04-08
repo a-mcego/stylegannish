@@ -108,18 +108,19 @@ class ScaledDense(tf.keras.Model):
             ret = self.activation(ret)
         return ret
 
-class ScaledConv2D3x3(tf.keras.Model):
-    def __init__(self, outsize, use_bias=True, bias_initializer=tf.zeros_initializer(), activation=None):
-        super(ScaledConv2D3x3, self).__init__()
+class ScaledConv2D(tf.keras.Model):
+    def __init__(self, outsize, use_bias=True, bias_initializer=tf.zeros_initializer(), activation=None, filter_size=3):
+        super(ScaledConv2D, self).__init__()
         self.outsize = outsize
         self.activation = activation
         self.use_bias = use_bias
         self.bias_initializer = bias_initializer
+        self.filter_size = filter_size
 
     def build(self, input_shape):
         self.insize = input_shape[-1]
-        self.dense_weights = self.add_weight('dense_weights',shape=[3, 3, self.insize, self.outsize], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
-        self.coef = tf.math.sqrt(2.0 / tf.cast(self.insize * 3 * 3,tf.float32))
+        self.dense_weights = self.add_weight('dense_weights',shape=[self.filter_size, self.filter_size, self.insize, self.outsize], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
+        self.coef = tf.math.sqrt(2.0 / tf.cast(self.insize * self.filter_size * self.filter_size,tf.float32))
         if self.use_bias:
             self.bias = self.add_weight('bias',shape=[self.outsize], initializer=self.bias_initializer, trainable=True)
         else:
@@ -154,7 +155,7 @@ class Blur3x3(tf.keras.Model):
 DenseLayer = ScaledDense
 
 #ConvLayer = Conv2D3x3
-ConvLayer = ScaledConv2D3x3
+ConvLayer = ScaledConv2D
 
 def get_grid(coords, sce):
     return tf.expand_dims(sce(tf.stack(tf.meshgrid(tf.linspace(0.0, 1.0, coords[1]),tf.linspace(0.0, 1.0, coords[0])),axis=-1)),axis=0)
@@ -163,18 +164,18 @@ class StyleBlock(tf.keras.Model):
     def __init__(self,latent_size_prev,latent_size):
         super(StyleBlock, self).__init__()
         self.lrelu = lambda x: tf.keras.activations.relu(x, alpha=0.2)
-        self.conv = ConvLayer(latent_size,use_bias=False)
+        self.conv = ConvLayer(latent_size,use_bias=False,filter_size=3)
         self.std_dense = DenseLayer(latent_size_prev, bias_initializer=tf.ones_initializer())
         self.mean_dense = DenseLayer(latent_size_prev)
         self.latent_size = latent_size
 
     def build(self, input_shape):
-        self.bias = self.add_weight('bias_1',shape=[1,input_shape[1],input_shape[2],self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
+        self.bias = self.add_weight('bias_1',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
         self.noise_coef = self.add_weight('noise_coef1',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
 
     def adaIN_normalize(self, data):
-        std = tf.math.reduce_std(data,axis=[-1,-2],keepdims=True)+1e-5
-        mean = tf.math.reduce_mean(data,axis=[-1,-2],keepdims=True)
+        std = tf.math.reduce_std(data,axis=[-1,-2,-3],keepdims=True)+1e-5
+        mean = tf.math.reduce_mean(data,axis=[-1,-2,-3],keepdims=True)
         data = (data-mean)/std
         return data
 
@@ -198,6 +199,7 @@ class StyleBlock(tf.keras.Model):
         data = self.lrelu(data)
         return data
 
+#styleGAN2 style block with weight mod/demod
 class StyleBlock2(tf.keras.Model):
     def __init__(self,latent_size_prev,latent_size):
         super(StyleBlock2, self).__init__()
@@ -207,7 +209,7 @@ class StyleBlock2(tf.keras.Model):
         self.conv_outsize = latent_size
 
     def build(self, input_shape):
-        self.bias = self.add_weight('styleblock_bias',shape=[1,input_shape[1],input_shape[2],self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
+        self.bias = self.add_weight('styleblock_bias',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
         self.noise_coef = self.add_weight('noise_coef',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
         self.conv_insize = input_shape[-1]
         self.conv_weights = self.add_weight('conv_weights',shape=[3, 3, self.conv_insize, self.conv_outsize], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
@@ -216,20 +218,43 @@ class StyleBlock2(tf.keras.Model):
     def call(self, data, latent):
         latent_out = self.std_dense(latent) # [BI] Transform incoming W to style.
 
+        #Modulation:
         data = data*latent_out[:, tf.newaxis, tf.newaxis, :] # [BhwI] Not fused => scale input activations.
         newweights = self.conv_weights * self.conv_coef
         data = tf.nn.conv2d(data, newweights, data_format='NHWC', strides=[1,1,1,1], padding='SAME')
+        #Weights are modulated separately
+        ww = newweights[tf.newaxis, :, :, :, :]*latent_out[:, tf.newaxis, tf.newaxis, :, tf.newaxis] # [BkkIO] Introduce minibatch dimension. & Scale input feature maps.
 
-        ww = newweights[tf.newaxis] # [BkkIO] Introduce minibatch dimension.
-        ww = ww*latent_out[:, tf.newaxis, tf.newaxis, :, tf.newaxis] # [BkkIO] Scale input feature maps.
+        #Demodulation:
         d = tf.math.rsqrt(tf.reduce_sum(tf.square(ww), axis=[1,2,3]) + 1e-8) # [BO] Scaling factor.
-        #ww = ww*d[:, tf.newaxis, tf.newaxis, tf.newaxis, :] # [BkkIO] Scale output feature maps.
 
         data = data*d[:, tf.newaxis, tf.newaxis, :] # [BhwO] Not fused => scale output activations.
 
         data += self.bias
         data += tf.multiply(tf.random.normal(data.shape),self.noise_coef)
         data = self.lrelu(data)
+        return data
+
+class PicOutBlock(tf.keras.Model):
+    def __init__(self, image_channels, _):
+        super(PicOutBlock, self).__init__()
+        self.pic_out = DenseLayer(image_channels, use_bias=False)
+    
+    def call(self, data, _):
+        data = self.pic_out(data)
+        return data
+
+#pic out block with weight modulation
+class PicOutBlockMod(tf.keras.Model):
+    def __init__(self, image_channels, latent_size):
+        super(PicOutBlockMod, self).__init__()
+        self.std_dense = DenseLayer(latent_size, bias_initializer=tf.ones_initializer())
+        self.pic_out = DenseLayer(image_channels, use_bias=False)
+    
+    def call(self, data, latent):
+        latent_out = self.std_dense(latent) # [BI] Transform incoming W to style.
+        data = data*latent_out[:, tf.newaxis, tf.newaxis, :]
+        data = self.pic_out(data)
         return data
 
 
@@ -250,7 +275,7 @@ class G_block(tf.keras.Model):
             self.upsample = None
 
         self.styleblock2 = StyleBlock2(latent_size,latent_size)
-        self.pic_out = DenseLayer(IMAGE_CHANNELS) #equivalent to 1x1 convolution
+        self.pic_out = PicOutBlockMod(IMAGE_CHANNELS,latent_size)
 
         if resize is not None:
             self.resizer = tf.keras.layers.UpSampling2D(size=resize, interpolation='bilinear')
@@ -264,7 +289,7 @@ class G_block(tf.keras.Model):
 
         data = self.styleblock2(data,latent)
 
-        pic = self.pic_out(data)
+        pic = self.pic_out(data,latent)
         if self.resizer is not None:
             pic = self.resizer(pic)
 
@@ -296,7 +321,7 @@ class GAN_g(tf.keras.Model):
         self.latentmapping = LatentMapping(LATENT_SIZES[0], n_denses=2)
 
     def build(self,input_shape):
-        self.dstart = self.add_weight('start_picture',shape=[1,4,4,LATENT_SIZES[0]], initializer=tf.zeros_initializer(), trainable=True)
+        self.dstart = self.add_weight('start_picture',shape=[1,4,4,LATENT_SIZES[0]], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
 
     def call(self,data):
         latent = self.latentmapping(data)
@@ -308,8 +333,8 @@ class GAN_g(tf.keras.Model):
             data, pic = b(data, latent)
             pics.append(pic)
 
-        pics = tf.math.accumulate_n(pics)
-        return pics
+        pics_summed = tf.math.accumulate_n(pics)
+        return pics_summed,pics
 
     #generate *size* vectors of LATENT_SIZES[0]
     #put them on a LATENT_SIZES[0]-dimensional sphere
@@ -325,8 +350,8 @@ class D_block(tf.keras.Model):
         super(D_block, self).__init__()
         self.lrelu = lambda x: tf.keras.activations.relu(x, alpha=0.2)
 
-        self.conv1 = ConvLayer(latent_size, activation=self.lrelu)
-        self.conv2 = ConvLayer(latent_size, activation=self.lrelu)
+        self.conv1 = ConvLayer(latent_size, activation=self.lrelu,filter_size=3)
+        self.conv2 = ConvLayer(latent_size, activation=self.lrelu,filter_size=3)
 
         self.conv_residual = DenseLayer(latent_size, activation=self.lrelu) #equivalent to 1x1 conv
         if downsample:
@@ -375,7 +400,7 @@ class GAN_d(tf.keras.Model):
     def call(self,data):
         data = self.cstart(data)
         for b in self.blocks:
-            data = self.blur(data)
+            #data = self.blur(data)
             data = b(data)
         data = tf.reshape(data,[data.shape[0],-1])
         data = self.cend(data)
@@ -392,7 +417,7 @@ optimizer_g_mapping = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.0, b
 @tf.function
 def train(data1, data2, rands1, rands2):
 
-    data1_fake = generator(rands1)
+    data1_fake,_ = generator(rands1)
     with tf.GradientTape() as tape:
         out_real = discriminator(data1)
         out_fake = discriminator(data1_fake)
@@ -408,7 +433,7 @@ def train(data1, data2, rands1, rands2):
     optimizer_d.apply_gradients(zip(gradients, discriminator.trainable_variables))
 
     with tf.GradientTape() as tape2:
-        data2_fake = generator(rands2)
+        data2_fake,_ = generator(rands2)
         out_real = discriminator(data2)
         out_fake = discriminator(data2_fake)
 
@@ -502,7 +527,8 @@ while True:
         loss = np.zeros(shape=(2))
 
         if IMAGE_CHANNELS == 3:
-            data_gt = to_int(generator_test(gens))
+            total, pics = generator_test(gens)
+            data_gt = to_int(total)
             data_gt = tf.concat(tf.split(data_gt,4,axis=0),axis=-3)
             data_gt = tf.concat(tf.split(data_gt,5,axis=0),axis=-2)
             data_gt = tf.squeeze(data_gt,axis=0)
