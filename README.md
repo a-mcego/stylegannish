@@ -1,2 +1,10 @@
 # stylegannish
-GAN implementation for TF2 based on StyleGAN and StyleGAN2
+GAN implementation for TensorFlow 2 based on StyleGAN2 (https://arxiv.org/pdf/1912.04958.pdf)
+
+# StyleGAN2 things not yet implemented
+* Style mixing regularisation
+* R1 regularisation
+* Path length regularisation
+* (As such, lazy regularisation as well)
+* Precision / recall statistics
+* Statistics for the contribution of each resolution to the output image (Figure 8 in the paper)
