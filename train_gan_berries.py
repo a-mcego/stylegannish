@@ -125,7 +125,7 @@ class ScaledConv2D(tf.keras.Model):
         self.dense_weights = self.add_weight('dense_weights',shape=[self.filter_size, self.filter_size, self.insize, self.outsize], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
         self.coef = tf.math.sqrt(2.0 / tf.cast(self.insize * self.filter_size * self.filter_size,tf.float32))
         if self.use_bias:
-            self.bias = self.add_weight('bias',shape=[self.outsize], initializer=self.bias_initializer, trainable=True)
+            self.bias = self.add_weight('bias',shape=[1,1,1,self.outsize], initializer=self.bias_initializer, trainable=True)
         else:
             self.bias = None
 
@@ -177,8 +177,8 @@ class StyleBlock(tf.keras.Model):
         self.noise_coef = self.add_weight('noise_coef1',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
 
     def adaIN_normalize(self, data):
-        std = tf.math.reduce_std(data,axis=[-1,-2,-3],keepdims=True)+1e-5
-        mean = tf.math.reduce_mean(data,axis=[-1,-2,-3],keepdims=True)
+        std = tf.math.reduce_std(data,axis=[-1,-2],keepdims=True)+1e-5
+        mean = tf.math.reduce_mean(data,axis=[-1,-2],keepdims=True)
         data = (data-mean)/std
         return data
 
