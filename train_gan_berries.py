@@ -21,6 +21,13 @@ def set_gpu_settings():
 
 set_gpu_settings()
 
+
+if len(sys.argv) != 2:
+    print("Give log save folder name as argument.")
+    exit(0)
+    
+SAVE_TIME = 1 #every SAVE_TIMEth print we also save a checkpoint
+SAVE_FOLDER = "saves/"+sys.argv[1]+"/"
 PRINTTIME = 30.0 #how often to print status and save test image, in seconds
 G_TEST_MOVING_AVERAGE_BETA = 0.999
 
@@ -39,10 +46,6 @@ loaded = tf.convert_to_tensor(loaded)
 
 #batch size
 BSIZE = 16
-
-#make the output directory if it doesnt exist yet
-if not os.path.exists("gan"):
-    os.mkdir("gan")
 
 with tf.device('/CPU:0'):
     loaded2 = tf.image.rot90(loaded,k=1)
@@ -409,10 +412,41 @@ class GAN_d(tf.keras.Model):
 
 generator = GAN_g()
 discriminator = GAN_d()
+generator_test = GAN_g()
+generator_test_initialized = False
 
 optimizer_d = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.0, beta_2=0.99, epsilon=1e-8, amsgrad=False)
 optimizer_g = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.0, beta_2=0.99, epsilon=1e-8, amsgrad=False)
 optimizer_g_mapping = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.0, beta_2=0.99, epsilon=1e-8, amsgrad=False)
+
+total_updates=0
+total_seen=0
+frame_n = 0
+
+def load_file_to_int(filename):
+    with open(filename,"r") as file:
+        ret = int(file.read())
+    return ret
+
+def save_int_to_file(filename,value):
+    with open(filename,"w") as file:
+        file.write("{0}".format(value))
+
+#make the output directories if they dont exist yet
+if not os.path.exists("saves"):
+    os.mkdir("saves")
+if not os.path.exists(SAVE_FOLDER[:-1]):
+    os.mkdir(SAVE_FOLDER[:-1])
+    os.mkdir(SAVE_FOLDER+"gan")
+else:
+    #hack to see if anything was ever saved
+    if os.path.isfile(SAVE_FOLDER+"total_updates.txt"):
+        checkpoint = tf.train.Checkpoint(opt_d=optimizer_d, opt_g=optimizer_g, opt_gm=optimizer_g_mapping, gen=generator, disc=discriminator, gen_test=generator_test)
+        checkpoint.restore(tf.train.latest_checkpoint(SAVE_FOLDER+'weights'))
+        total_updates = load_file_to_int(SAVE_FOLDER+"total_updates.txt")
+        total_seen = load_file_to_int(SAVE_FOLDER+"total_seen.txt")
+        frame_n = load_file_to_int(SAVE_FOLDER+"frame_n.txt")
+        generator_test_initialized = True
 
 @tf.function
 def train(data1, data2, rands1, rands2):
@@ -462,18 +496,13 @@ def train(data1, data2, rands1, rands2):
 
     return [tf.reduce_mean(loss_d), tf.reduce_mean(loss_g)]
 
-total_updates=0
-total_seen=0
 updates = 0
 seen = 0
 loss = np.zeros(shape=(2))
-frame_n = 0
 
 starttime = time.time()+5.0
 
 gens = generator.get_random(20)
-
-generator_test = None
 
 @tf.function
 def get_data():
@@ -501,9 +530,9 @@ while True:
     loss += [n.numpy() for n in train(data, data2, rands, rands2)]
 
     #do moving average for testing. G_TEST_MOVING_AVERAGE_BETA=0.999 in the paper(s)
-    if generator_test is None:
+    if generator_test_initialized == False:
         #if test generator hasnt been initialized, initialize it now.
-        generator_test = GAN_g()
+        generator_test_initialized = True
         generator_test(generator.get_random(BSIZE))
         zipped = zip(generator_test.trainable_variables, generator.trainable_variables)
         for z in zipped:
@@ -552,6 +581,14 @@ while True:
             data = np.concatenate([color,depth,rects],axis=0)
 
         im = Image.fromarray(data)
-        im.save("gan/" + str(frame_n) + ".png")
+        im.save(SAVE_FOLDER + "gan/" + str(frame_n) + ".png")
 
         frame_n += 1
+
+        if frame_n%SAVE_TIME == 0:
+            checkpoint = tf.train.Checkpoint(opt_d=optimizer_d, opt_g=optimizer_g, opt_gm=optimizer_g_mapping, gen=generator, disc=discriminator, gen_test=generator_test)
+            checkpoint.save(file_prefix=SAVE_FOLDER+'weights/ckpt')
+            save_int_to_file(SAVE_FOLDER+"total_updates.txt",total_updates)
+            save_int_to_file(SAVE_FOLDER+"total_seen.txt",total_seen)
+            save_int_to_file(SAVE_FOLDER+"frame_n.txt", frame_n)
+            print("checkpoint saved.\r",flush=True,end='')

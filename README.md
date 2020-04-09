@@ -13,4 +13,4 @@ GAN implementation for TensorFlow 2 based on StyleGAN2 (https://arxiv.org/pdf/19
 * Output scaling in the discriminator (footnote 3 on page 6)
 
 # Other TODO things
-* Save states
+(None right now)
