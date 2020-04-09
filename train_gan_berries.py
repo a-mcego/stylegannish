@@ -446,6 +446,9 @@ else:
         total_updates = load_file_to_int(SAVE_FOLDER+"total_updates.txt")
         total_seen = load_file_to_int(SAVE_FOLDER+"total_seen.txt")
         frame_n = load_file_to_int(SAVE_FOLDER+"frame_n.txt")
+
+        generator(generator.get_random(BSIZE))
+        generator_test(generator.get_random(BSIZE)) #have to do this to initialize weights
         generator_test_initialized = True
 
 @tf.function
