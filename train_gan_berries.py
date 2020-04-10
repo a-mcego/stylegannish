@@ -361,6 +361,7 @@ class D_block(tf.keras.Model):
         else:
             self.resizer = None
         self.minibatch_stddev = minibatch_stddev
+        self.normalisation_coef = tf.math.rsqrt(2.0)
 
     def do_mb_stddev(self, data):
         y = data-tf.reduce_mean(data, axis=0, keepdims=True)
@@ -375,7 +376,7 @@ class D_block(tf.keras.Model):
         if self.minibatch_stddev:
             data = self.do_mb_stddev(data)
 
-        data = self.conv2(self.conv1(data))+self.conv_residual(data)
+        data = (self.conv2(self.conv1(data))+self.conv_residual(data))*self.normalisation_coef
         if self.resizer is not None:
             data = self.resizer(data)
         return data
