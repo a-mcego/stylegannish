@@ -2,7 +2,6 @@
 GAN implementation for TensorFlow 2 based on StyleGAN2 (https://arxiv.org/pdf/1912.04958.pdf)
 
 # StyleGAN2 things not yet implemented
-* Style mixing regularisation
 * R1 regularisation
 * Path length regularisation
 * (As such, lazy regularisation as well)
