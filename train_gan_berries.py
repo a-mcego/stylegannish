@@ -1,5 +1,4 @@
 from __future__ import print_function
-import vizdoom as vzd
 from matplotlib import pyplot as plt
 from random import choice
 import time
@@ -8,7 +7,6 @@ import sys
 import os
 import cv2
 import tensorflow as tf
-import cv2
 #tf.debugging.set_log_device_placement(True)
 
 from PIL import Image
