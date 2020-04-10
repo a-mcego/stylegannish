@@ -26,7 +26,7 @@ if len(sys.argv) != 2:
     print("Give log save folder name as argument.")
     exit(0)
     
-SAVE_TIME = 1 #every SAVE_TIMEth print we also save a checkpoint
+SAVE_TIME = 10 #every SAVE_TIMEth print we also save a checkpoint
 SAVE_FOLDER = "saves/"+sys.argv[1]+"/"
 PRINTTIME = 30.0 #how often to print status and save test image, in seconds
 G_TEST_MOVING_AVERAGE_BETA = 0.999
@@ -34,18 +34,18 @@ G_TEST_MOVING_AVERAGE_BETA = 0.999
 LATENT_SIZES = [128, 128, 128,  128,  64,   32] #from smallest image to biggest
 IMAGE_CHANNELS = 3
 DO_RANDOM_FLIPS = True #flip images randomly up/down and left/right when training
+STYLE_MIX_CHANCE = 0.9
+NUM_LAYERS = len(LATENT_SIZES)
 
-#loaded = np.load("wholedemo_smaller.npy")
+#batch size
+BSIZE = 16
+
+#load images from numpy package with type uint8 and shape [image,height,width,channel]
 loaded = np.load("berries128.npy")
-#loaded = tf.convert_to_tensor(loaded[:,:,:,:IMAGE_CHANNELS])
-#loaded = np.pad(loaded, [[0,0],[4,4],[0,0],[0,0]], 'constant', constant_values = 128)
 
 print("Loaded images:",loaded.shape)
 
 loaded = tf.convert_to_tensor(loaded)
-
-#batch size
-BSIZE = 16
 
 with tf.device('/CPU:0'):
     loaded2 = tf.image.rot90(loaded,k=1)
@@ -154,14 +154,8 @@ class Blur3x3(tf.keras.Model):
         ret = tf.transpose(ret,[0,2,3,1])
         return ret
 
-#DenseLayer = tf.keras.layers.Dense
 DenseLayer = ScaledDense
-
-#ConvLayer = Conv2D3x3
 ConvLayer = ScaledConv2D
-
-def get_grid(coords, sce):
-    return tf.expand_dims(sce(tf.stack(tf.meshgrid(tf.linspace(0.0, 1.0, coords[1]),tf.linspace(0.0, 1.0, coords[0])),axis=-1)),axis=0)
 
 class StyleBlock(tf.keras.Model):
     def __init__(self,latent_size_prev,latent_size):
@@ -329,12 +323,14 @@ class GAN_g(tf.keras.Model):
     def call(self,data):
         latent = self.latentmapping(data)
 
-        newshape = [data.shape[0],4,4,LATENT_SIZES[0]]
+        newshape = [data.shape[1],4,4,LATENT_SIZES[0]]
         data = tf.broadcast_to(self.dstart, newshape)
         pics = []
+        counter=0
         for b in self.blocks:
-            data, pic = b(data, latent)
+            data, pic = b(data, latent[counter])
             pics.append(pic)
+            counter += 1
 
         pics_summed = tf.math.accumulate_n(pics)
         return pics_summed,pics
@@ -345,6 +341,11 @@ class GAN_g(tf.keras.Model):
         vec = tf.random.uniform([size,LATENT_SIZES[0]], minval=-1.0, maxval=1.0, dtype=tf.float32)
         vec_len = tf.math.sqrt(tf.reduce_sum(tf.square(vec),axis=-1,keepdims=True))
         vec = tf.multiply(vec,tf.math.reciprocal(vec_len))
+        return vec
+
+    def get_random_full(self,size):
+        vec = self.get_random(size)
+        vec = tf.broadcast_to(vec[tf.newaxis], [NUM_LAYERS,vec.shape[0],vec.shape[1]])
         return vec
 
 class D_block(tf.keras.Model):
@@ -422,6 +423,7 @@ optimizer_g_mapping = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.0, b
 total_updates=0
 total_seen=0
 frame_n = 0
+example_latents = generator.get_random_full(20)
 
 def load_file_to_int(filename):
     with open(filename,"r") as file:
@@ -431,6 +433,7 @@ def load_file_to_int(filename):
 def save_int_to_file(filename,value):
     with open(filename,"w") as file:
         file.write("{0}".format(value))
+
 
 #make the output directories if they dont exist yet
 if not os.path.exists("saves"):
@@ -447,12 +450,50 @@ else:
         total_seen = load_file_to_int(SAVE_FOLDER+"total_seen.txt")
         frame_n = load_file_to_int(SAVE_FOLDER+"frame_n.txt")
 
-        generator(generator.get_random(BSIZE))
-        generator_test(generator.get_random(BSIZE)) #have to do this to initialize weights
+        generator(generator.get_random_full(BSIZE))
+        generator_test(generator.get_random_full(BSIZE)) #have to do this to initialize weights
         generator_test_initialized = True
+        example_latents = tf.convert_to_tensor(np.load(SAVE_FOLDER+"example_latents.npy"))
+
+def get_data(size):
+    data_len = loaded.shape[0]
+    indices = tf.random.uniform([size],maxval=data_len,dtype=tf.int32)
+    data = tf.cast(tf.gather(loaded,indices),tf.float32)/(255.0/2.0)-1.0
+    if DO_RANDOM_FLIPS:
+        data = tf.image.random_flip_left_right(data)
+        data = tf.image.random_flip_up_down(data)
+    return data
+
+def style_mixing():
+    #latents shape: [2*BSIZE,LATENTSIZE]
+    #output shape: [NUM_LAYERS,BSIZE,LATENTSIZE]
+
+    rnds = tf.where(tf.random.uniform([BSIZE])<STYLE_MIX_CHANCE,
+                    tf.random.uniform(shape=[BSIZE],minval=0,maxval=NUM_LAYERS-1,dtype=tf.int32),
+                    tf.constant(NUM_LAYERS,shape=[BSIZE],dtype=tf.int32))[tf.newaxis,:]
+    rnds = tf.broadcast_to(rnds,shape=[NUM_LAYERS,BSIZE])
+
+    ranges = tf.broadcast_to(tf.range(NUM_LAYERS)[:,tf.newaxis],shape=[NUM_LAYERS,BSIZE])
+
+    result = tf.cast(rnds<ranges,tf.float32)
+
+    result = tf.stack([1.0-result,result],axis=-2)[:,:,:,tf.newaxis]
+
+    latents = tf.stack([generator.get_random(BSIZE),generator.get_random(BSIZE)])
+    latents = latents[tf.newaxis,:,:,:]
+    latents = tf.broadcast_to(latents,[NUM_LAYERS,2,BSIZE,latents.shape[-1]])
+
+    latents *= result
+    latents = tf.reduce_sum(latents,axis=1)
+    return latents
 
 @tf.function
-def train(data1, data2, rands1, rands2):
+def train():
+    data1 = get_data(BSIZE)
+    data2 = get_data(BSIZE)
+
+    rands1 = style_mixing()
+    rands2 = style_mixing()
 
     data1_fake,_ = generator(rands1)
     with tf.GradientTape() as tape:
@@ -505,38 +546,39 @@ loss = np.zeros(shape=(2))
 
 starttime = time.time()+5.0
 
-gens = generator.get_random(20)
-
-@tf.function
-def get_data():
-    data_len = loaded.shape[0]
-    indices = tf.random.uniform([BSIZE],maxval=data_len,dtype=tf.int32)
-    data = tf.cast(tf.gather(loaded,indices),tf.float32)/(255.0/2.0)-1.0
-    if DO_RANDOM_FLIPS:
-        data = tf.image.random_flip_left_right(data)
-        data = tf.image.random_flip_up_down(data)
-    return data
-
 @tf.function
 def update_generator_moving_avg(g, g_t):
     zipped = zip(g_t.trainable_variables, g.trainable_variables)
     for z in zipped:
         z[0].assign(z[0]*G_TEST_MOVING_AVERAGE_BETA + z[1]*(1.0-G_TEST_MOVING_AVERAGE_BETA))
 
+#style mixing regularisation
+"""rnds = tf.where(tf.random.uniform([BSIZE])<STYLE_MIX_CHANCE,tf.random.uniform(shape=[BSIZE],minval=0,maxval=NUM_LAYERS-1,dtype=tf.int32),tf.constant(NUM_LAYERS,shape=[BSIZE],dtype=tf.int32))[tf.newaxis,:]
+rnds = tf.broadcast_to(rnds,shape=[NUM_LAYERS,BSIZE])
+
+ranges = tf.broadcast_to(tf.range(NUM_LAYERS)[:,tf.newaxis],shape=[NUM_LAYERS,BSIZE])
+
+result = tf.cast(rnds<ranges,tf.float32)
+
+result = tf.stack([1.0-result,result],axis=-2)[:,:,:,tf.newaxis]
+
+arr = tf.stack([generator.get_random(BSIZE),generator.get_random(BSIZE)])
+arr = arr[tf.newaxis,:,:,:]
+arr = tf.broadcast_to(arr,[NUM_LAYERS,2,BSIZE,arr.shape[-1]])
+
+result *= arr
+result = tf.reduce_sum(result,axis=1)
+exit(0)"""
+
+
 while True:
-    data = get_data()
-    data2 = get_data()
-
-    rands = generator.get_random(BSIZE)
-    rands2 = generator.get_random(BSIZE)
-
-    loss += [n.numpy() for n in train(data, data2, rands, rands2)]
+    loss += [n.numpy() for n in train()]
 
     #do moving average for testing. G_TEST_MOVING_AVERAGE_BETA=0.999 in the paper(s)
     if generator_test_initialized == False:
         #if test generator hasnt been initialized, initialize it now.
         generator_test_initialized = True
-        generator_test(generator.get_random(BSIZE))
+        generator_test(generator.get_random_full(BSIZE))
         zipped = zip(generator_test.trainable_variables, generator.trainable_variables)
         for z in zipped:
             z[0].assign(z[1])
@@ -558,30 +600,13 @@ while True:
         seen = 0
         loss = np.zeros(shape=(2))
 
-        if IMAGE_CHANNELS == 3:
-            total, pics = generator_test(gens)
-            data_gt = to_int(total)
-            data_gt = tf.concat(tf.split(data_gt,4,axis=0),axis=-3)
-            data_gt = tf.concat(tf.split(data_gt,5,axis=0),axis=-2)
-            data_gt = tf.squeeze(data_gt,axis=0)
+        total, pics = generator_test(example_latents)
+        data_gt = to_int(total)
+        data_gt = tf.concat(tf.split(data_gt,4,axis=0),axis=-3)
+        data_gt = tf.concat(tf.split(data_gt,5,axis=0),axis=-2)
+        data_gt = tf.squeeze(data_gt,axis=0)
 
-            data = data_gt.numpy()
-
-        elif IMAGE_CHANNELS == 5:
-            rands = generator.get_random(4)
-
-            data = generator(rands)
-            data = to_int(data)
-            data = tf.concat([data[0],data[1],data[2],data[3]],axis=-2)
-
-            color = data[:,:,0:3]
-            depth = data[:,:,3:4]
-            rects = data[:,:,4:5]
-
-            depth = np.broadcast_to(depth, color.shape)
-            rects = np.broadcast_to(rects, color.shape)
-
-            data = np.concatenate([color,depth,rects],axis=0)
+        data = data_gt.numpy()
 
         im = Image.fromarray(data)
         im.save(SAVE_FOLDER + "gan/" + str(frame_n) + ".png")
@@ -594,4 +619,5 @@ while True:
             save_int_to_file(SAVE_FOLDER+"total_updates.txt",total_updates)
             save_int_to_file(SAVE_FOLDER+"total_seen.txt",total_seen)
             save_int_to_file(SAVE_FOLDER+"frame_n.txt", frame_n)
+            np.save(SAVE_FOLDER+"example_latents.npy", example_latents.numpy())
             print("checkpoint saved.\r",flush=True,end='')
