@@ -132,3 +132,4 @@ dmypy.json
 *.mp4
 gan/*.png
 saves/
+*.png

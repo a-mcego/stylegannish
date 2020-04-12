@@ -23,7 +23,50 @@ set_gpu_settings()
 if len(sys.argv) != 2:
     print("Give log save folder name as argument.")
     exit(0)
-    
+
+
+
+class BerryData:
+    def __init__(self, do_random_flips_rotations):
+        #load images from numpy package with type uint8 and shape [image,height,width,channel]
+        self.loaded = np.load("berries128.npy")
+        self.loaded = tf.convert_to_tensor(self.loaded)
+        self.do_random_flips_rotations = do_random_flips_rotations
+        if self.do_random_flips_rotations:
+            with tf.device('/CPU:0'):
+                loaded_rot = tf.image.rot90(self.loaded,k=1)
+                self.loaded = tf.concat([self.loaded,loaded_rot], axis=0)
+
+    def get_data(self, size):
+        data_len = self.loaded.shape[0]
+        indices = tf.random.uniform([size],maxval=data_len,dtype=tf.int32)
+        data = tf.cast(tf.gather(self.loaded,indices),tf.float32)/(255.0/2.0)-1.0
+        if self.do_random_flips_rotations:
+            data = tf.image.random_flip_left_right(data)
+            data = tf.image.random_flip_up_down(data)
+        return data
+
+class DoomData:
+    def __init__(self):
+        #load images from numpy package with type uint8 and shape [image,height,width,channel]
+        self.loaded = np.load("wholedemo_smaller.npy")
+        self.loaded = np.pad(self.loaded, [[0,0],[4,4],[0,0],[0,0]], 'constant', constant_values = 128)
+        self.loaded = tf.convert_to_tensor(self.loaded)
+        self.random_flip_warning_shown = False
+
+    def get_data(self, size):
+        data_len = self.loaded.shape[0]
+        indices = tf.random.uniform([size],maxval=data_len,dtype=tf.int32)
+        data = tf.cast(tf.gather(self.loaded,indices),tf.float32)/(255.0/2.0)-1.0
+        return data
+
+    def get_image_shape(self):
+        return self.loaded.shape[1:]
+
+#dataset = BerryData(do_random_flips_rotations=True)
+dataset = DoomData()
+print("Loaded images:",dataset.loaded.shape)
+
 SAVE_TIME = 10 #every SAVE_TIMEth print we also save a checkpoint
 SAVE_FOLDER = "saves/"+sys.argv[1]+"/"
 PRINTTIME = 30.0 #how often to print status and save test image, in seconds
@@ -31,25 +74,15 @@ G_TEST_MOVING_AVERAGE_BETA = 0.999
 
 LATENT_SIZES = [128, 128, 128,  128,  64,   32] #from smallest image to biggest
 IMAGE_CHANNELS = 3
-DO_RANDOM_FLIPS = True #flip images randomly up/down and left/right when training
 STYLE_MIX_CHANCE = 0.9
+
 NUM_LAYERS = len(LATENT_SIZES)
+RESIZE_AMOUNTS = [[2**x,2**x] for x in range(NUM_LAYERS-1,-1,-1)]
+LAYER_IMAGE_SIZES = [[dataset.loaded.shape[1]//x[0],dataset.loaded.shape[2]//x[1]] for x in RESIZE_AMOUNTS]
+RESIZE_AMOUNTS[-1] = None
 
 #batch size
 BSIZE = 16
-
-#load images from numpy package with type uint8 and shape [image,height,width,channel]
-loaded = np.load("berries128.npy")
-
-print("Loaded images:",loaded.shape)
-
-loaded = tf.convert_to_tensor(loaded)
-
-with tf.device('/CPU:0'):
-    loaded2 = tf.image.rot90(loaded,k=1)
-    loaded = tf.concat([loaded,loaded2], axis=0)
-
-print(loaded.shape)
 
 def to_float(data):
     return tf.cast(data,tf.float32)/(255.0/2.0)-1.0
@@ -306,22 +339,22 @@ class GAN_g(tf.keras.Model):
         super(GAN_g, self).__init__()
         self.lrelu = lambda x: tf.keras.activations.relu(x, alpha=0.2)
         self.blocks = [
-            G_block(LATENT_SIZES[0],LATENT_SIZES[0],[4,4],False,[32,32]), 
-            G_block(LATENT_SIZES[0],LATENT_SIZES[1],[8,8],True,[16,16]), 
-            G_block(LATENT_SIZES[1],LATENT_SIZES[2],[16,16],True,[8,8]), 
-            G_block(LATENT_SIZES[2],LATENT_SIZES[3],[32,32],True,[4,4]),
-            G_block(LATENT_SIZES[3],LATENT_SIZES[4],[64,64],True,[2,2]),
-            G_block(LATENT_SIZES[4],LATENT_SIZES[5],[128,128],True,None)
+            G_block(LATENT_SIZES[0],LATENT_SIZES[0],LAYER_IMAGE_SIZES[0],False,RESIZE_AMOUNTS[0]), 
+            G_block(LATENT_SIZES[0],LATENT_SIZES[1],LAYER_IMAGE_SIZES[1],True,RESIZE_AMOUNTS[1]), 
+            G_block(LATENT_SIZES[1],LATENT_SIZES[2],LAYER_IMAGE_SIZES[2],True,RESIZE_AMOUNTS[2]), 
+            G_block(LATENT_SIZES[2],LATENT_SIZES[3],LAYER_IMAGE_SIZES[3],True,RESIZE_AMOUNTS[3]),
+            G_block(LATENT_SIZES[3],LATENT_SIZES[4],LAYER_IMAGE_SIZES[4],True,RESIZE_AMOUNTS[4]),
+            G_block(LATENT_SIZES[4],LATENT_SIZES[5],LAYER_IMAGE_SIZES[5],True,RESIZE_AMOUNTS[5])
         ]
-        self.latentmapping = LatentMapping(LATENT_SIZES[0], n_denses=2)
+        self.latentmapping = LatentMapping(LATENT_SIZES[0], n_denses=8)
 
     def build(self,input_shape):
-        self.dstart = self.add_weight('start_picture',shape=[1,4,4,LATENT_SIZES[0]], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
+        self.dstart = self.add_weight('start_picture',shape=[1,LAYER_IMAGE_SIZES[0][0],LAYER_IMAGE_SIZES[0][1],LATENT_SIZES[0]], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
 
     def call(self,data):
         latent = self.latentmapping(data)
 
-        newshape = [data.shape[1],4,4,LATENT_SIZES[0]]
+        newshape = [data.shape[1],LAYER_IMAGE_SIZES[0][0],LAYER_IMAGE_SIZES[0][1],LATENT_SIZES[0]]
         data = tf.broadcast_to(self.dstart, newshape)
         pics = []
         counter=0
@@ -415,9 +448,9 @@ discriminator = GAN_d()
 generator_test = GAN_g()
 generator_test_initialized = False
 
-optimizer_d = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.0, beta_2=0.99, epsilon=1e-8, amsgrad=False)
-optimizer_g = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.0, beta_2=0.99, epsilon=1e-8, amsgrad=False)
-optimizer_g_mapping = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.0, beta_2=0.99, epsilon=1e-8, amsgrad=False)
+optimizer_d = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.0, beta_2=0.99, epsilon=1e-8, amsgrad=True)
+optimizer_g = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.0, beta_2=0.99, epsilon=1e-8, amsgrad=True)
+optimizer_g_mapping = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.0, beta_2=0.99, epsilon=1e-8, amsgrad=True)
 
 total_updates=0
 total_seen=0
@@ -454,15 +487,6 @@ else:
         generator_test_initialized = True
         example_latents = tf.convert_to_tensor(np.load(SAVE_FOLDER+"example_latents.npy"))
 
-def get_data(size):
-    data_len = loaded.shape[0]
-    indices = tf.random.uniform([size],maxval=data_len,dtype=tf.int32)
-    data = tf.cast(tf.gather(loaded,indices),tf.float32)/(255.0/2.0)-1.0
-    if DO_RANDOM_FLIPS:
-        data = tf.image.random_flip_left_right(data)
-        data = tf.image.random_flip_up_down(data)
-    return data
-
 def style_mixing():
     #latents shape: [2*BSIZE,LATENTSIZE]
     #output shape: [NUM_LAYERS,BSIZE,LATENTSIZE]
@@ -488,8 +512,8 @@ def style_mixing():
 
 @tf.function
 def train():
-    data1 = get_data(BSIZE)
-    data2 = get_data(BSIZE)
+    data1 = dataset.get_data(BSIZE)
+    data2 = dataset.get_data(BSIZE)
 
     rands1 = style_mixing()
     rands2 = style_mixing()
