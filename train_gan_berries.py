@@ -9,232 +9,61 @@ import cv2
 import tensorflow as tf
 #tf.debugging.set_log_device_placement(True)
 
+import datasets
+import util
+import layers
+
 from PIL import Image
-
-def set_gpu_settings():
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-      for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-
-set_gpu_settings()
-
 
 if len(sys.argv) != 2:
     print("Give log save folder name as argument.")
     exit(0)
 
+util.set_gpu_settings()
 
-
-class BerryData:
-    def __init__(self, do_random_flips_rotations):
-        #load images from numpy package with type uint8 and shape [image,height,width,channel]
-        self.loaded = np.load("berries128.npy")
-        self.loaded = tf.convert_to_tensor(self.loaded)
-        self.do_random_flips_rotations = do_random_flips_rotations
-        if self.do_random_flips_rotations:
-            with tf.device('/CPU:0'):
-                loaded_rot = tf.image.rot90(self.loaded,k=1)
-                self.loaded = tf.concat([self.loaded,loaded_rot], axis=0)
-
-    def get_data(self, size):
-        data_len = self.loaded.shape[0]
-        indices = tf.random.uniform([size],maxval=data_len,dtype=tf.int32)
-        data = tf.cast(tf.gather(self.loaded,indices),tf.float32)/(255.0/2.0)-1.0
-        if self.do_random_flips_rotations:
-            data = tf.image.random_flip_left_right(data)
-            data = tf.image.random_flip_up_down(data)
-        return data
-
-class DoomData:
-    def __init__(self):
-        #load images from numpy package with type uint8 and shape [image,height,width,channel]
-        self.loaded = np.load("wholedemo_smaller.npy")
-        self.loaded = np.pad(self.loaded, [[0,0],[4,4],[0,0],[0,0]], 'constant', constant_values = 128)
-        self.loaded = tf.convert_to_tensor(self.loaded)
-        self.random_flip_warning_shown = False
-
-    def get_data(self, size):
-        data_len = self.loaded.shape[0]
-        indices = tf.random.uniform([size],maxval=data_len,dtype=tf.int32)
-        data = tf.cast(tf.gather(self.loaded,indices),tf.float32)/(255.0/2.0)-1.0
-        return data
-
-    def get_image_shape(self):
-        return self.loaded.shape[1:]
-
-#dataset = BerryData(do_random_flips_rotations=True)
-dataset = DoomData()
+dataset = datasets.Berry("berries128.npy", do_random_flips_rotations=True)
+#dataset = datasets.Doom("wholedemo_smaller.npy")
+#dataset = datasets.Map("L413.png")
 print("Loaded images:",dataset.loaded.shape)
 
 SAVE_TIME = 10 #every SAVE_TIMEth print we also save a checkpoint
 SAVE_FOLDER = "saves/"+sys.argv[1]+"/"
 PRINTTIME = 30.0 #how often to print status and save test image, in seconds
+
+#-----start hyperparams-----
 G_TEST_MOVING_AVERAGE_BETA = 0.999
 
 LATENT_SIZES = [128, 128, 128,  128,  64,   32] #from smallest image to biggest
+#LATENT_SIZES = [512, 512, 512, 512, 256, 128,  64,  32,  16] #from the paper, going all the way up to 1024^2
+
 IMAGE_CHANNELS = 3
 STYLE_MIX_CHANCE = 0.9
 
+BATCH_SIZE = 16
+
+INTER_LAYER_INTERPOLATION = 'bilinear'
+OUTPUT_INTERPOLATION = 'bilinear'
+USE_POINTWISE_DENSES = True
+#-----end hyperparams-----
+
+#these are calculated using the hyperparams
 NUM_LAYERS = len(LATENT_SIZES)
 RESIZE_AMOUNTS = [[2**x,2**x] for x in range(NUM_LAYERS-1,-1,-1)]
-LAYER_IMAGE_SIZES = [[dataset.loaded.shape[1]//x[0],dataset.loaded.shape[2]//x[1]] for x in RESIZE_AMOUNTS]
+LAYER_IMAGE_SIZES = [[dataset.get_image_shape()[0]//x[0],dataset.get_image_shape()[1]//x[1]] for x in RESIZE_AMOUNTS]
 RESIZE_AMOUNTS[-1] = None
 
-#batch size
-BSIZE = 16
-
-def to_float(data):
-    return tf.cast(data,tf.float32)/(255.0/2.0)-1.0
-
-def to_int(data):
-    return tf.cast(tf.clip_by_value((data+1.0)*(255.0/2.0),0.0,255.0),tf.uint8)
-
-
-class Conv2D3x3(tf.keras.Model):
-    def __init__(self, outsize, activation=None):
-        super(Conv2D3x3, self).__init__()
-        self.conv = tf.keras.layers.Conv2D(outsize, [3,3], strides=[1,1], padding="same", activation=activation)
-
-    def call(self, data):
-        return self.conv(data)
-
-class SinCosEmbed(tf.keras.Model):
-    def __init__(self):
-        super(SinCosEmbed, self).__init__()
-        phi = 1.61803398875
-        nums = [0,1,2,3,4,5]
-        coefs = [4.0*phi**n for n in nums]
-        self.coefs = tf.multiply(tf.convert_to_tensor(coefs, dtype=tf.float32),1.57079632679)#constant is pi/2
-
-    def call(self, data):
-        out = tf.expand_dims(data,axis=-1)
-        out = tf.multiply(out, self.coefs)
-        out_sin = tf.math.sin(out)
-        out_cos = tf.math.cos(out)
-        out = tf.concat([out_sin,out_cos],axis=-1)
-        out = tf.reshape(out, tf.concat([out.shape[:-2],[-1]],axis=-1))
-        return out
-
-class ScaledDense(tf.keras.Model):
-    def __init__(self, outsize, use_bias=True, bias_initializer=tf.zeros_initializer(), activation=None):
-        super(ScaledDense, self).__init__()
-        self.outsize = outsize
-        self.activation = activation
-        self.use_bias = use_bias
-        self.bias_initializer = bias_initializer
-
-    def build(self, input_shape):
-        self.insize = input_shape[-1]
-        self.dense_weights = self.add_weight('dense_weights',shape=[self.insize,self.outsize], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
-        self.coef = tf.math.sqrt(2.0 / tf.cast(self.insize,tf.float32))
-        if self.use_bias:
-            self.bias = self.add_weight('bias',shape=[self.outsize], initializer=self.bias_initializer, trainable=True)
-        else:
-            self.bias = None
-        
-    def call(self, data):
-        newweights = self.dense_weights * self.coef
-        ret = tf.linalg.matmul(data,newweights)
-        if self.bias is not None:
-            ret = ret + self.bias
-        if self.activation is not None:
-            ret = self.activation(ret)
-        return ret
-
-class ScaledConv2D(tf.keras.Model):
-    def __init__(self, outsize, use_bias=True, bias_initializer=tf.zeros_initializer(), activation=None, filter_size=3):
-        super(ScaledConv2D, self).__init__()
-        self.outsize = outsize
-        self.activation = activation
-        self.use_bias = use_bias
-        self.bias_initializer = bias_initializer
-        self.filter_size = filter_size
-
-    def build(self, input_shape):
-        self.insize = input_shape[-1]
-        self.dense_weights = self.add_weight('dense_weights',shape=[self.filter_size, self.filter_size, self.insize, self.outsize], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
-        self.coef = tf.math.sqrt(2.0 / tf.cast(self.insize * self.filter_size * self.filter_size,tf.float32))
-        if self.use_bias:
-            self.bias = self.add_weight('bias',shape=[1,1,1,self.outsize], initializer=self.bias_initializer, trainable=True)
-        else:
-            self.bias = None
-
-    def call(self, data):
-        newweights = self.dense_weights * self.coef
-        ret = tf.nn.conv2d(data,newweights,strides=[1,1],padding="SAME")
-        if self.bias is not None:
-            ret = ret + self.bias
-        if self.activation is not None:
-            ret = self.activation(ret)
-        return ret
-
-#a layer that blurs every input feature map separately with a 3x3 filter
-class Blur3x3(tf.keras.Model):
-    def __init__(self):
-        super(Blur3x3, self).__init__()
-        self.filter = tf.convert_to_tensor([[1,2,1],[2,4,2],[1,2,1]],dtype=tf.float32)*(1.0/16.0)
-        self.filter = self.filter[:,:,tf.newaxis,tf.newaxis]
-
-    def call(self, data):
-        ret = tf.transpose(data,[0,3,1,2])
-        shape = ret.shape
-        ret = tf.reshape(ret, [ret.shape[0]*ret.shape[1],1,ret.shape[2],ret.shape[3]])
-        ret = tf.nn.conv2d(ret,self.filter,strides=[1,1],padding="SAME", data_format='NCHW')
-        ret = tf.reshape(ret,shape)
-        ret = tf.transpose(ret,[0,2,3,1])
-        return ret
-
-DenseLayer = ScaledDense
-ConvLayer = ScaledConv2D
-
+#styleGAN2 style block with weight mod/demod
 class StyleBlock(tf.keras.Model):
     def __init__(self,latent_size_prev,latent_size):
         super(StyleBlock, self).__init__()
         self.lrelu = lambda x: tf.keras.activations.relu(x, alpha=0.2)
-        self.conv = ConvLayer(latent_size,use_bias=False,filter_size=3)
-        self.std_dense = DenseLayer(latent_size_prev, bias_initializer=tf.ones_initializer())
-        self.mean_dense = DenseLayer(latent_size_prev)
-        self.latent_size = latent_size
-
-    def build(self, input_shape):
-        self.bias = self.add_weight('bias_1',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
-        self.noise_coef = self.add_weight('noise_coef1',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
-
-    def adaIN_normalize(self, data):
-        std = tf.math.reduce_std(data,axis=[-1,-2],keepdims=True)+1e-5
-        mean = tf.math.reduce_mean(data,axis=[-1,-2],keepdims=True)
-        data = (data-mean)/std
-        return data
-
-    def adaIN_modulate(self, data, latent):
-        newstd = self.std_dense(latent)
-        newmean = self.mean_dense(latent)
-
-        newshape = [newstd.shape[0],1,1,newstd.shape[1]]
-        newstd = tf.reshape(newstd,newshape)
-        newmean = tf.reshape(newmean,newshape) #can do this because newstd and newmean have the same shape
-
-        #everything is in the right shape, just put it all together.
-        return data*newstd+newmean
-
-    def call(self, data, latent):
-        data = self.adaIN_modulate(data, latent)
-        data = self.conv(data) 
-        data = self.adaIN_normalize(data)
-        data += self.bias
-        data += tf.multiply(tf.random.normal(data.shape),self.noise_coef)
-        data = self.lrelu(data)
-        return data
-
-#styleGAN2 style block with weight mod/demod
-class StyleBlock2(tf.keras.Model):
-    def __init__(self,latent_size_prev,latent_size):
-        super(StyleBlock2, self).__init__()
-        self.lrelu = lambda x: tf.keras.activations.relu(x, alpha=0.2)
-        self.std_dense = DenseLayer(latent_size_prev, bias_initializer=tf.ones_initializer())
+        self.std_dense = layers.ScaledDense(latent_size_prev, bias_initializer=tf.ones_initializer())
         self.latent_size = latent_size
         self.conv_outsize = latent_size
+
+        if USE_POINTWISE_DENSES:
+            self.D1 = layers.ScaledDense(latent_size*4,activation=self.lrelu)
+            self.D2 = layers.ScaledDense(latent_size,activation=self.lrelu)
 
     def build(self, input_shape):
         self.bias = self.add_weight('styleblock_bias',shape=[1,1,1,self.latent_size], initializer=tf.zeros_initializer(), trainable=True)
@@ -257,27 +86,21 @@ class StyleBlock2(tf.keras.Model):
         d = tf.math.rsqrt(tf.reduce_sum(tf.square(ww), axis=[1,2,3]) + 1e-8) # [BO] Scaling factor.
 
         data = data*d[:, tf.newaxis, tf.newaxis, :] # [BhwO] Not fused => scale output activations.
-
         data += self.bias
         data += tf.multiply(tf.random.normal(data.shape),self.noise_coef)
         data = self.lrelu(data)
-        return data
 
-class PicOutBlock(tf.keras.Model):
-    def __init__(self, image_channels, _):
-        super(PicOutBlock, self).__init__()
-        self.pic_out = DenseLayer(image_channels, use_bias=False)
-    
-    def call(self, data, _):
-        data = self.pic_out(data)
+        if USE_POINTWISE_DENSES:
+            data = self.D2(self.D1(data))
+
         return data
 
 #pic out block with weight modulation
-class PicOutBlockMod(tf.keras.Model):
+class PicOutBlock(tf.keras.Model):
     def __init__(self, image_channels, latent_size):
-        super(PicOutBlockMod, self).__init__()
-        self.std_dense = DenseLayer(latent_size, bias_initializer=tf.ones_initializer())
-        self.pic_out = DenseLayer(image_channels, use_bias=False)
+        super(PicOutBlock, self).__init__()
+        self.std_dense = layers.ScaledDense(latent_size, bias_initializer=tf.ones_initializer())
+        self.pic_out = layers.ScaledDense(image_channels, use_bias=False)
     
     def call(self, data, latent):
         latent_out = self.std_dense(latent) # [BI] Transform incoming W to style.
@@ -297,16 +120,16 @@ class G_block(tf.keras.Model):
         self.image_size = image_size
 
         if upsample:
-            self.upsample = tf.keras.layers.UpSampling2D(interpolation='bilinear')
-            self.styleblock1 = StyleBlock2(latent_size_prev,latent_size)
+            self.upsample = tf.keras.layers.UpSampling2D(interpolation=INTER_LAYER_INTERPOLATION)
+            self.styleblock1 = StyleBlock(latent_size_prev,latent_size)
         else:
             self.upsample = None
 
-        self.styleblock2 = StyleBlock2(latent_size,latent_size)
-        self.pic_out = PicOutBlockMod(IMAGE_CHANNELS,latent_size)
+        self.styleblock2 = StyleBlock(latent_size,latent_size)
+        self.pic_out = PicOutBlock(IMAGE_CHANNELS,latent_size)
 
         if resize is not None:
-            self.resizer = tf.keras.layers.UpSampling2D(size=resize, interpolation='bilinear')
+            self.resizer = tf.keras.layers.UpSampling2D(size=resize, interpolation=OUTPUT_INTERPOLATION)
         else:
             self.resizer = None
 
@@ -327,7 +150,7 @@ class LatentMapping(tf.keras.Model):
     def __init__(self, latent_size, n_denses):
         super(LatentMapping, self).__init__()
         self.lrelu = lambda x: tf.keras.activations.relu(x, alpha=0.2)
-        self.denses = [DenseLayer(latent_size, activation=self.lrelu) for _ in range(n_denses)]
+        self.denses = [layers.ScaledDense(latent_size, activation=self.lrelu) for _ in range(n_denses)]
         
     def call(self, data):
         for dense in self.denses:
@@ -348,14 +171,19 @@ class GAN_g(tf.keras.Model):
         ]
         self.latentmapping = LatentMapping(LATENT_SIZES[0], n_denses=8)
 
-    def build(self,input_shape):
-        self.dstart = self.add_weight('start_picture',shape=[1,LAYER_IMAGE_SIZES[0][0],LAYER_IMAGE_SIZES[0][1],LATENT_SIZES[0]], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
+    #def build(self,input_shape):
+        #self.dstart = self.add_weight('start_picture',shape=[1,LAYER_IMAGE_SIZES[0][0],LAYER_IMAGE_SIZES[0][1],LATENT_SIZES[0]], initializer=tf.random_normal_initializer(mean=0.0,stddev=1.0), trainable=True)
 
-    def call(self,data):
-        latent = self.latentmapping(data)
+    def call(self,latent):
+        latent = self.latentmapping(latent)
 
-        newshape = [data.shape[1],LAYER_IMAGE_SIZES[0][0],LAYER_IMAGE_SIZES[0][1],LATENT_SIZES[0]]
-        data = tf.broadcast_to(self.dstart, newshape)
+        #dstart = self.dstart
+        #newshape = [data.shape[1],dstart.shape[1],dstart.shape[2],dstart.shape[3]]
+        #data = tf.broadcast_to(dstart, newshape)
+
+        #data = tf.random.normal(shape=[data.shape[1],LAYER_IMAGE_SIZES[0][0],LAYER_IMAGE_SIZES[0][1],LATENT_SIZES[0]],mean=0.0,stddev=1.0)
+        data = tf.zeros(shape=[latent.shape[1],LAYER_IMAGE_SIZES[0][0],LAYER_IMAGE_SIZES[0][1],LATENT_SIZES[0]])
+
         pics = []
         counter=0
         for b in self.blocks:
@@ -385,10 +213,10 @@ class D_block(tf.keras.Model):
         super(D_block, self).__init__()
         self.lrelu = lambda x: tf.keras.activations.relu(x, alpha=0.2)
 
-        self.conv1 = ConvLayer(latent_size, activation=self.lrelu,filter_size=3)
-        self.conv2 = ConvLayer(latent_size, activation=self.lrelu,filter_size=3)
+        self.conv1 = layers.ScaledConv2D(latent_size, activation=self.lrelu,filter_size=3)
+        self.conv2 = layers.ScaledConv2D(latent_size, activation=self.lrelu,filter_size=3)
 
-        self.conv_residual = DenseLayer(latent_size, activation=self.lrelu) #equivalent to 1x1 conv
+        self.conv_residual = layers.ScaledDense(latent_size, activation=self.lrelu) #equivalent to 1x1 conv
         if downsample:
             self.resizer = tf.keras.layers.AveragePooling2D()
         else:
@@ -418,9 +246,7 @@ class GAN_d(tf.keras.Model):
     def __init__(self):
         super(GAN_d, self).__init__()
         self.lrelu = lambda x: tf.keras.activations.relu(x, alpha=0.2)
-        self.cstart = DenseLayer(LATENT_SIZES[-1], activation=self.lrelu) #equivalent to 1x1 conv
-
-        self.blur = Blur3x3()
+        self.cstart = layers.ScaledDense(LATENT_SIZES[-1], activation=self.lrelu) #equivalent to 1x1 conv
 
         self.blocks = [
             D_block(LATENT_SIZES[-1], True, minibatch_stddev=True),
@@ -430,13 +256,12 @@ class GAN_d(tf.keras.Model):
             D_block(LATENT_SIZES[-5], True, minibatch_stddev=True),
             D_block(LATENT_SIZES[-6], False, minibatch_stddev=True)
         ]
-        self.cend = DenseLayer(LATENT_SIZES[-6],activation=self.lrelu) #the last layer is basically a dense over the whole thing.
-        self.cend2 = DenseLayer(1, use_bias=False)
+        self.cend = layers.ScaledDense(LATENT_SIZES[-6],activation=self.lrelu) #the last layer is basically a dense over the whole thing.
+        self.cend2 = layers.ScaledDense(1, use_bias=False)
 
     def call(self,data):
         data = self.cstart(data)
         for b in self.blocks:
-            #data = self.blur(data)
             data = b(data)
         data = tf.reshape(data,[data.shape[0],-1])
         data = self.cend(data)
@@ -457,16 +282,6 @@ total_seen=0
 frame_n = 0
 example_latents = generator.get_random_full(20)
 
-def load_file_to_int(filename):
-    with open(filename,"r") as file:
-        ret = int(file.read())
-    return ret
-
-def save_int_to_file(filename,value):
-    with open(filename,"w") as file:
-        file.write("{0}".format(value))
-
-
 #make the output directories if they dont exist yet
 if not os.path.exists("saves"):
     os.mkdir("saves")
@@ -478,33 +293,29 @@ else:
     if os.path.isfile(SAVE_FOLDER+"total_updates.txt"):
         checkpoint = tf.train.Checkpoint(opt_d=optimizer_d, opt_g=optimizer_g, opt_gm=optimizer_g_mapping, gen=generator, disc=discriminator, gen_test=generator_test)
         checkpoint.restore(tf.train.latest_checkpoint(SAVE_FOLDER+'weights'))
-        total_updates = load_file_to_int(SAVE_FOLDER+"total_updates.txt")
-        total_seen = load_file_to_int(SAVE_FOLDER+"total_seen.txt")
-        frame_n = load_file_to_int(SAVE_FOLDER+"frame_n.txt")
+        total_updates = util.load_file_to_int(SAVE_FOLDER+"total_updates.txt")
+        total_seen = util.load_file_to_int(SAVE_FOLDER+"total_seen.txt")
+        frame_n = util.load_file_to_int(SAVE_FOLDER+"frame_n.txt")
 
-        generator(generator.get_random_full(BSIZE))
-        generator_test(generator.get_random_full(BSIZE)) #have to do this to initialize weights
+        generator(generator.get_random_full(BATCH_SIZE))
+        generator_test(generator.get_random_full(BATCH_SIZE)) #have to do this to initialize weights
         generator_test_initialized = True
         example_latents = tf.convert_to_tensor(np.load(SAVE_FOLDER+"example_latents.npy"))
 
-def style_mixing():
-    #latents shape: [2*BSIZE,LATENTSIZE]
-    #output shape: [NUM_LAYERS,BSIZE,LATENTSIZE]
+def style_mixing(batch_size, style_mix_chance):
+    #output shape: [NUM_LAYERS,BATCH_SIZE,LATENTSIZE]
 
-    rnds = tf.where(tf.random.uniform([BSIZE])<STYLE_MIX_CHANCE,
-                    tf.random.uniform(shape=[BSIZE],minval=0,maxval=NUM_LAYERS-1,dtype=tf.int32),
-                    tf.constant(NUM_LAYERS,shape=[BSIZE],dtype=tf.int32))[tf.newaxis,:]
-    rnds = tf.broadcast_to(rnds,shape=[NUM_LAYERS,BSIZE])
-
-    ranges = tf.broadcast_to(tf.range(NUM_LAYERS)[:,tf.newaxis],shape=[NUM_LAYERS,BSIZE])
-
+    rnds = tf.where(tf.random.uniform([batch_size])<style_mix_chance,
+                    tf.random.uniform(shape=[batch_size],minval=0,maxval=NUM_LAYERS-1,dtype=tf.int32),
+                    tf.constant(NUM_LAYERS,shape=[batch_size],dtype=tf.int32))[tf.newaxis,:]
+    rnds = tf.broadcast_to(rnds,shape=[NUM_LAYERS,batch_size])
+    ranges = tf.broadcast_to(tf.range(NUM_LAYERS)[:,tf.newaxis],shape=[NUM_LAYERS,batch_size])
     result = tf.cast(rnds<ranges,tf.float32)
-
     result = tf.stack([1.0-result,result],axis=-2)[:,:,:,tf.newaxis]
 
-    latents = tf.stack([generator.get_random(BSIZE),generator.get_random(BSIZE)])
+    latents = tf.stack([generator.get_random(batch_size),generator.get_random(batch_size)])
     latents = latents[tf.newaxis,:,:,:]
-    latents = tf.broadcast_to(latents,[NUM_LAYERS,2,BSIZE,latents.shape[-1]])
+    latents = tf.broadcast_to(latents,[NUM_LAYERS,2,batch_size,latents.shape[-1]])
 
     latents *= result
     latents = tf.reduce_sum(latents,axis=1)
@@ -512,12 +323,8 @@ def style_mixing():
 
 @tf.function
 def train():
-    data1 = dataset.get_data(BSIZE)
-    data2 = dataset.get_data(BSIZE)
-
-    rands1 = style_mixing()
-    rands2 = style_mixing()
-
+    data1 = dataset.get_data(BATCH_SIZE)
+    rands1 = style_mixing(BATCH_SIZE, STYLE_MIX_CHANCE)
     data1_fake,_ = generator(rands1)
     with tf.GradientTape() as tape:
         out_real = discriminator(data1)
@@ -533,6 +340,8 @@ def train():
     gradients = tape.gradient(loss_d, discriminator.trainable_variables)
     optimizer_d.apply_gradients(zip(gradients, discriminator.trainable_variables))
 
+    data2 = dataset.get_data(BATCH_SIZE)
+    rands2 = style_mixing(BATCH_SIZE, STYLE_MIX_CHANCE)
     with tf.GradientTape() as tape2:
         data2_fake,_ = generator(rands2)
         out_real = discriminator(data2)
@@ -575,25 +384,6 @@ def update_generator_moving_avg(g, g_t):
     for z in zipped:
         z[0].assign(z[0]*G_TEST_MOVING_AVERAGE_BETA + z[1]*(1.0-G_TEST_MOVING_AVERAGE_BETA))
 
-#style mixing regularisation
-"""rnds = tf.where(tf.random.uniform([BSIZE])<STYLE_MIX_CHANCE,tf.random.uniform(shape=[BSIZE],minval=0,maxval=NUM_LAYERS-1,dtype=tf.int32),tf.constant(NUM_LAYERS,shape=[BSIZE],dtype=tf.int32))[tf.newaxis,:]
-rnds = tf.broadcast_to(rnds,shape=[NUM_LAYERS,BSIZE])
-
-ranges = tf.broadcast_to(tf.range(NUM_LAYERS)[:,tf.newaxis],shape=[NUM_LAYERS,BSIZE])
-
-result = tf.cast(rnds<ranges,tf.float32)
-
-result = tf.stack([1.0-result,result],axis=-2)[:,:,:,tf.newaxis]
-
-arr = tf.stack([generator.get_random(BSIZE),generator.get_random(BSIZE)])
-arr = arr[tf.newaxis,:,:,:]
-arr = tf.broadcast_to(arr,[NUM_LAYERS,2,BSIZE,arr.shape[-1]])
-
-result *= arr
-result = tf.reduce_sum(result,axis=1)
-exit(0)"""
-
-
 while True:
     loss += [n.numpy() for n in train()]
 
@@ -601,7 +391,7 @@ while True:
     if generator_test_initialized == False:
         #if test generator hasnt been initialized, initialize it now.
         generator_test_initialized = True
-        generator_test(generator.get_random_full(BSIZE))
+        generator_test(generator.get_random_full(BATCH_SIZE))
         zipped = zip(generator_test.trainable_variables, generator.trainable_variables)
         for z in zipped:
             z[0].assign(z[1])
@@ -610,7 +400,7 @@ while True:
         update_generator_moving_avg(generator, generator_test)
 
     updates += 1
-    seen += BSIZE
+    seen += BATCH_SIZE
 
     if time.time()-starttime > PRINTTIME:
         starttime += PRINTTIME
@@ -624,7 +414,7 @@ while True:
         loss = np.zeros(shape=(2))
 
         total, pics = generator_test(example_latents)
-        data_gt = to_int(total)
+        data_gt = util.f32_to_u8(total)
         data_gt = tf.concat(tf.split(data_gt,4,axis=0),axis=-3)
         data_gt = tf.concat(tf.split(data_gt,5,axis=0),axis=-2)
         data_gt = tf.squeeze(data_gt,axis=0)
@@ -639,8 +429,8 @@ while True:
         if frame_n%SAVE_TIME == 0:
             checkpoint = tf.train.Checkpoint(opt_d=optimizer_d, opt_g=optimizer_g, opt_gm=optimizer_g_mapping, gen=generator, disc=discriminator, gen_test=generator_test)
             checkpoint.save(file_prefix=SAVE_FOLDER+'weights/ckpt')
-            save_int_to_file(SAVE_FOLDER+"total_updates.txt",total_updates)
-            save_int_to_file(SAVE_FOLDER+"total_seen.txt",total_seen)
-            save_int_to_file(SAVE_FOLDER+"frame_n.txt", frame_n)
+            util.save_int_to_file(SAVE_FOLDER+"total_updates.txt",total_updates)
+            util.save_int_to_file(SAVE_FOLDER+"total_seen.txt",total_seen)
+            util.save_int_to_file(SAVE_FOLDER+"frame_n.txt", frame_n)
             np.save(SAVE_FOLDER+"example_latents.npy", example_latents.numpy())
             print("checkpoint saved.\r",flush=True,end='')
